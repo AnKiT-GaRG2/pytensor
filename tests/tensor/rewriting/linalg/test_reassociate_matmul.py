@@ -306,6 +306,69 @@ class TestReassociateChain:
         result = _reassociate([A, B, C, D], [ab @ C @ D, ab.sum()])
         result.assert_graph(*_canonical(ab @ (C @ D), ab.sum()))
 
+    def test_reuses_a_product_computed_elsewhere(self):
+        # Both orders of x.T @ A @ x cost n^2 + n, but `A @ x` is an output of its own,
+        # so x.T @ (A @ x) only costs the extra n
+        A = pt.matrix("A", shape=(100, 100))
+        x = pt.matrix("x", shape=(100, 1))
+
+        result = _reassociate([A, x], [x.T @ A @ x, A @ x])
+        result.assert_graph(*_canonical(x.T @ (A @ x), A @ x))
+        rng = np.random.default_rng(0)
+        result.assert_eval(rng.normal(size=(100, 100)), rng.normal(size=(100, 1)))
+
+    def test_reuses_a_product_computed_elsewhere_symbolic_shapes(self):
+        A = pt.matrix("A", shape=(None, None))
+        x = pt.matrix("x", shape=(None, 1))
+
+        result = _reassociate([A, x], [x.T @ A @ x, A @ x])
+        result.assert_graph(*_canonical(x.T @ (A @ x), A @ x))
+        rng = np.random.default_rng(0)
+        result.assert_eval(rng.normal(size=(7, 7)), rng.normal(size=(7, 1)))
+
+    def test_reuses_a_longer_product_computed_elsewhere(self):
+        # On its own (A @ B) @ C costs 200_000 and A @ (B @ C) costs 1_100_000, but
+        # `B @ C` is an output too, so A @ (B @ C) only costs the extra 100_000
+        A = pt.matrix("A", shape=(10, 100))
+        B = pt.matrix("B", shape=(100, 100))
+        C = pt.matrix("C", shape=(100, 100))
+
+        result = _reassociate([A, B, C], [A @ B @ C, B @ C])
+        result.assert_graph(*_canonical(A @ (B @ C), B @ C))
+        rng = np.random.default_rng(0)
+        result.assert_eval(
+            rng.normal(size=(10, 100)),
+            rng.normal(size=(100, 100)),
+            rng.normal(size=(100, 100)),
+        )
+
+    def test_no_reuse_without_a_shared_product(self):
+        # The same tie as above with nothing to reuse, so the order is left alone
+        A = pt.matrix("A", shape=(100, 100))
+        x = pt.matrix("x", shape=(100, 1))
+        out = x.T @ A @ x
+
+        result = _reassociate([A, x], [out])
+        result.assert_graph(*_canonical(out))
+
+    def test_no_reuse_of_a_different_product(self):
+        # `A.T @ x` is not `A @ x`
+        A = pt.matrix("A", shape=(100, 100))
+        x = pt.matrix("x", shape=(100, 1))
+        outs = [x.T @ A @ x, A.T @ x]
+
+        result = _reassociate([A, x], outs)
+        result.assert_graph(*_canonical(*outs))
+
+    def test_quadratic_form_gradient(self):
+        A = pt.matrix("A", shape=(20, 20))
+        x = pt.matrix("x", shape=(20, 1))
+        out = (x.T @ A @ x).sum()
+
+        result = _reassociate([A, x], [out, pt.grad(out, x)])
+        rng = np.random.default_rng(0)
+        result.assert_eval(rng.normal(size=(20, 20)), rng.normal(size=(20, 1)))
+
     @pytest.mark.parametrize("assoc", ["left", "right"])
     def test_failed_chain_solved_once(self, monkeypatch, assoc):
         solve = reassociate._solve_chain

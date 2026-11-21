@@ -1,6 +1,6 @@
 import math
 from collections import defaultdict, deque
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Collection, Mapping, Sequence
 from itertools import pairwise
 from typing import cast
 
@@ -441,12 +441,17 @@ def _build_unification(
     return unified, canonicalize
 
 
-def _solve_chain(shapes: list[tuple[int, ...]]) -> tuple[int, dict]:
+def _solve_chain(
+    shapes: list[tuple[int, ...]], free: Collection[tuple[int, int]] = ()
+) -> tuple[int, dict]:
     """Matrix-chain DP over integer operand shapes.
 
     Returns ``(best_total_cost, dp_table)`` where ``dp_table[(i, j)]`` is
     ``(cost, split_k, result_shape)`` for the subchain ``shapes[i..j]`` inclusive.
     Ties keep the lower split index.
+
+    The product of a subchain in `free` is already computed elsewhere in the graph, so
+    it costs nothing and has no split (``split_k`` is ``None``).
     """
     n = len(shapes)
     dp: dict[tuple[int, int], tuple[int, int | None, tuple[int, ...]]] = {
@@ -467,7 +472,7 @@ def _solve_chain(shapes: list[tuple[int, ...]]) -> tuple[int, dict]:
 
             # Length >= 2 always has at least one split -- invariant violated.
             assert best is not None, f"DP found no candidate for subchain ({i},{j})"
-            dp[(i, j)] = best
+            dp[(i, j)] = (0, None, best[2]) if (i, j) in free else best
 
     return dp[(0, n - 1)][0], dp
 
@@ -483,6 +488,13 @@ def _tree_cost(shapes: list[Shape], dp: dict) -> CostExpr:
             result_shape[(i, j)] = shapes[i]
             continue
         split = dp[(i, j)][1]
+        if split is None:
+            # The product already exists elsewhere in the graph, so it costs nothing
+            shape = shapes[i]
+            for k in range(i + 1, j + 1):
+                shape = _matmul_result_shape(shape, shapes[k])
+            result_shape[(i, j)] = shape
+            continue
         if not ready:
             work.extend([(i, j, True), (split + 1, j, False), (i, split, False)])
             continue
@@ -518,6 +530,45 @@ def _existing_cost(
     return total
 
 
+def _find_free_slices(
+    operands: list[tuple[Variable, tuple[DimShuffle, ...]]],
+    consumed: list[Apply],
+    fgraph: FunctionGraph,
+) -> dict[tuple[int, int], Variable]:
+    """Subchains of `operands` whose product a matmul outside the chain already computes.
+
+    Maps ``(i, j)`` to the variable holding ``operands[i] @ ... @ operands[j]``. Only
+    plain operands count, because a lifted operand is rebuilt as a new node and would
+    not match, and a subchain is built from two shorter ones that are known already.
+    """
+    in_chain = set(consumed)
+    known: dict[tuple[int, int], Variable] = {
+        (i, i): var for i, (var, lifts) in enumerate(operands) if not lifts
+    }
+    free: dict[tuple[int, int], Variable] = {}
+    last = len(operands) - 1
+
+    for length in range(2, last + 1):  # the whole chain is never free
+        for i in range(last - length + 2):
+            j = i + length - 1
+            for k in range(i, j):
+                left, right = known.get((i, k)), known.get((k + 1, j))
+                if left is None or right is None:
+                    continue
+                for node, _ in fgraph.clients[left]:
+                    if node in in_chain:
+                        continue
+                    match node.op, *node.inputs:
+                        case Dot() | Blockwise(Dot()), l_in, r_in if (
+                            l_in is left and r_in is right
+                        ):
+                            known[(i, j)] = free[(i, j)] = node.outputs[0]
+                            break
+                if (i, j) in known:
+                    break
+    return free
+
+
 def _contract(left: Variable, right: Variable) -> Variable:
     """``left @ right`` in the form canonicalize leaves it."""
     if left.type.ndim == right.type.ndim == 2:
@@ -531,8 +582,12 @@ def _contract(left: Variable, right: Variable) -> Variable:
 def _build_tree(
     operands: list[tuple[Variable, tuple[DimShuffle, ...]]],
     dp: dict,
+    free: Mapping[tuple[int, int], Variable] | None = None,
 ) -> Variable:
-    """Materialize the matmul tree recorded in the DP table over `operands`."""
+    """Materialize the matmul tree recorded in the DP table over `operands`.
+
+    A subchain in `free` is not rebuilt: its existing variable is used as it is.
+    """
     top = (0, len(operands) - 1)
     materialized: dict[tuple[int, int], Variable] = {}
     work: list[tuple[int, int, bool]] = [(*top, False)]
@@ -546,6 +601,10 @@ def _build_tree(
             materialized[(i, j)] = var
             continue
         _, split, _ = dp[(i, j)]
+        if split is None:
+            assert free is not None
+            materialized[(i, j)] = free[(i, j)]
+            continue
         if not ready:
             work.append((i, j, True))
             work.append((split + 1, j, False))
@@ -658,7 +717,9 @@ class ReassociateMatmulChain(GraphRewriter):
                 tuple(d if isinstance(d, int) else point[d] for d in shape)
                 for shape in unified
             ]
-            numeric_cost, dp = _solve_chain(numeric)
+            # A product that is already computed outside the chain costs nothing to reuse
+            free = _find_free_slices(operands, consumed, fgraph)
+            numeric_cost, dp = _solve_chain(numeric, free)
             if numeric_cost >= old_cost.evaluate(point):
                 continue
             new_cost = _tree_cost(unified, dp)
@@ -668,7 +729,7 @@ class ReassociateMatmulChain(GraphRewriter):
 
             visited.update(consumed)
 
-            new_out = _build_tree(operands, dp)
+            new_out = _build_tree(operands, dp, free)
             old_out = top.outputs[0]
             copy_stack_trace(old_out, new_out)
             fgraph.replace(old_out, new_out, reason="reassociate_matmul")
